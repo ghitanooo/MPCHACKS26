@@ -23,6 +23,11 @@ EXPLAINER = None
 BASELINE_EXPECTED_VALUE = None
 FEATURES_USED = None
 
+# Globally cached features and SHAP values for ultra-fast instant explanations
+SCORED_DF_CACHE = None
+SHAP_VALUES_CACHE = None
+X_SCALED_DF_CACHE = None
+
 def load_geoip_database():
     global GEO_READER
     if GEO_READER is not None:
@@ -209,7 +214,7 @@ def engineer_features(df_input: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def run_anomaly_detection(df: pd.DataFrame) -> pd.DataFrame:
-    global MODELS, SCALER, EXPLAINER, BASELINE_EXPECTED_VALUE, FEATURES_USED
+    global MODELS, SCALER, EXPLAINER, BASELINE_EXPECTED_VALUE, FEATURES_USED, SHAP_VALUES_CACHE, X_SCALED_DF_CACHE
     
     model_features = [
         'amount', 'time_since_last_transaction', 'amount_vs_avg_ratio', 'card_avg_transaction_amount',
@@ -279,6 +284,9 @@ def run_anomaly_detection(df: pd.DataFrame) -> pd.DataFrame:
         
     BASELINE_EXPECTED_VALUE = EXPLAINER.expected_value
     
+    SHAP_VALUES_CACHE = shap_values
+    X_SCALED_DF_CACHE = X_scaled_df
+    
     # Store top SHAP reasons for each row directly in the dataframe
     top_reasons_list = []
     for idx in range(len(X_scaled_df)):
@@ -323,8 +331,10 @@ def run_anomaly_detection(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def run_full_pipeline(df: pd.DataFrame) -> pd.DataFrame:
+    global SCORED_DF_CACHE
     df_engineered = engineer_features(df)
     df_scored = run_anomaly_detection(df_engineered)
+    SCORED_DF_CACHE = df_scored
     return df_scored
 
 def explain_transaction_with_gemini(transaction_id: str) -> str:
@@ -333,6 +343,8 @@ def explain_transaction_with_gemini(transaction_id: str) -> str:
     and calls the Gemini-2.5-Flash model to generate a professional natural language explanation.
     Falls back to a high-fidelity local SHAP-based explanation if the API key is not configured.
     """
+    global SCORED_DF_CACHE, SHAP_VALUES_CACHE, X_SCALED_DF_CACHE
+
     # Configure Gemini API or flag local fallback
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     use_local_fallback = False
@@ -342,22 +354,30 @@ def explain_transaction_with_gemini(transaction_id: str) -> str:
         use_local_fallback = True
 
     try:
-        # Load the base file
-        db_path = 'transactions.csv'
-        if not os.path.exists(db_path):
-            db_path = os.path.join('backend', 'transactions.csv')
+        # If cache contains the transaction_id, fetch from cache instantly! (0ms latency)
+        if SCORED_DF_CACHE is not None and transaction_id in SCORED_DF_CACHE['transaction_id'].values:
+            df_scored = SCORED_DF_CACHE
+            shap_values = SHAP_VALUES_CACHE
+            X_scaled_df = X_SCALED_DF_CACHE
+        else:
+            # Load the base file
+            db_path = 'transactions.csv'
+            if not os.path.exists(db_path):
+                db_path = os.path.join('backend', 'transactions.csv')
+                
+            if not os.path.exists(db_path):
+                return "Transaction database csv file not found."
+    
+            df_orig = pd.read_csv(db_path)
             
-        if not os.path.exists(db_path):
-            return "Transaction database csv file not found."
-
-        df_orig = pd.read_csv(db_path)
-        
-        # Verify transaction exists
-        if transaction_id not in df_orig['transaction_id'].values:
-            return f"Transaction {transaction_id} not found in database."
-            
-        # Run full pipeline to calculate features, scaler and SHAP values
-        df_scored = run_full_pipeline(df_orig)
+            # Verify transaction exists
+            if transaction_id not in df_orig['transaction_id'].values:
+                return f"Transaction {transaction_id} not found in database."
+                
+            # Run full pipeline to calculate features, scaler and SHAP values
+            df_scored = run_full_pipeline(df_orig)
+            shap_values = SHAP_VALUES_CACHE
+            X_scaled_df = X_SCALED_DF_CACHE
         
         # Locate the specific transaction row index
         row_idx = df_scored[df_scored['transaction_id'] == transaction_id].index[0]

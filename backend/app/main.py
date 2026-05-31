@@ -20,11 +20,11 @@ app.add_middleware(
 
 app.include_router(router, prefix="/api")
 
-@app.on_event("startup")
-async def clear_database_on_startup():
-    # Clear the database on startup so the app is always empty initially
-    await transactions_collection.delete_many({})
-    await audit_collection.delete_many({})
+# @app.on_event("startup")
+# async def clear_database_on_startup():
+#     # Clear the database on startup so the app is always empty initially
+#     await transactions_collection.delete_many({})
+#     await audit_collection.delete_many({})
 
 @app.get("/health")
 def health_check():
