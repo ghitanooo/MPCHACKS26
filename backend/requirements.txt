@@ -1,12 +1,13 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pandas
 numpy
 scipy
 scikit-learn
 pyod
-kneed
 shap
 geoip2
 motor
 python-multipart
+anthropic
+python-dotenv

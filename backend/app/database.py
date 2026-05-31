@@ -1,9 +1,14 @@
 import os
 from motor.motor_asyncio import AsyncIOMotorClient
+from dotenv import load_dotenv
 
-MONGO_URL = "mongodb+srv://yaliboustibi_db_user:MPC123@mpc-hack.mtkwtuz.mongodb.net/?appName=MPC-HACK"
-client = AsyncIOMotorClient(MONGO_URL)
-db = client.fraud_hunter
+load_dotenv()
 
-transactions_collection = db.get_collection("transactions")
-audit_collection = db.get_collection("audit_ledger")
+MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
+DB_NAME = os.getenv("DB_NAME", "fraud_platform")
+
+client = AsyncIOMotorClient(MONGODB_URL)
+db = client[DB_NAME]
+
+transactions_collection = db["transactions"]
+audit_collection = db["audit_ledger"]

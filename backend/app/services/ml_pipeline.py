@@ -1,455 +1,577 @@
+import os
+import json
+import warnings
 import pandas as pd
 import numpy as np
-import os
-import urllib.request
 import geoip2.database
-from sklearn.preprocessing import RobustScaler
 from scipy.stats import rankdata
+from sklearn.preprocessing import RobustScaler
 from pyod.models.iforest import IForest
 from pyod.models.ecod import ECOD
 from pyod.models.copod import COPOD
 from pyod.models.hbos import HBOS
 import shap
-import google.generativeai as genai
-import warnings
+import anthropic
 
-warnings.filterwarnings('ignore', category=DeprecationWarning)
+warnings.filterwarnings("ignore")
 
-# We will cache the reader, models, explainer and baseline globally so they aren't re-initialized.
+# ── Global cache ──────────────────────────────────────────────────────────────
 GEO_READER = None
-MODELS = None
-SCALER = None
-EXPLAINER = None
-BASELINE_EXPECTED_VALUE = None
-FEATURES_USED = None
-
-# Globally cached features and SHAP values for ultra-fast instant explanations
 SCORED_DF_CACHE = None
 SHAP_VALUES_CACHE = None
 X_SCALED_DF_CACHE = None
+FEATURES_USED = None
 
-def load_geoip_database():
+# ── GeoIP ─────────────────────────────────────────────────────────────────────
+
+def _load_geo():
     global GEO_READER
     if GEO_READER is not None:
         return GEO_READER
-        
-    db_path = 'GeoLite2-Country.mmdb'
-    if not os.path.exists(db_path):
-        print("Downloading GeoLite2-Country.mmdb...")
-        # Using a reliable mirror for the mmdb file
-        url = "https://git.io/GeoLite2-Country.mmdb"
-        urllib.request.urlretrieve(url, db_path)
-    
-    try:
-        GEO_READER = geoip2.database.Reader(db_path)
-        print("Local GeoIP database loaded successfully.")
-    except Exception as e:
-        print(f"Error loading GeoIP database: {e}")
-        GEO_READER = None
+    db_path = os.path.join(os.path.dirname(__file__), "..", "..", "GeoLite2-Country.mmdb")
+    db_path = os.path.abspath(db_path)
+    if os.path.exists(db_path):
+        try:
+            GEO_READER = geoip2.database.Reader(db_path)
+        except Exception:
+            GEO_READER = None
     return GEO_READER
 
-def get_country(ip):
+
+def _get_country(ip: str):
     if pd.isna(ip):
         return None
     try:
-        reader = load_geoip_database()
+        reader = _load_geo()
         if reader:
-            response = reader.country(ip)
-            return response.country.iso_code
-    except:
+            return reader.country(ip).country.iso_code
+    except Exception:
         pass
     return None
 
+
+# ── Feature engineering ───────────────────────────────────────────────────────
+
+def _rolling_count(df: pd.DataFrame, group_col: str, ts_col: str, window_seconds: int) -> pd.Series:
+    result = pd.Series(0, index=df.index, dtype=int)
+    df_sorted = df.sort_values([group_col, ts_col])
+    for _, grp in df_sorted.groupby(group_col):
+        ts = grp[ts_col].values.astype("int64") // 10**9
+        for i, idx in enumerate(grp.index):
+            t = ts[i]
+            result[idx] = int(np.searchsorted(ts[:i], t - window_seconds, side="left"))
+            if i > 0:
+                result[idx] = i - int(np.searchsorted(ts[:i], t - window_seconds, side="left"))
+    return result
+
+
+def _rolling_nunique(df: pd.DataFrame, group_col: str, ts_col: str, val_col: str, window_seconds: int) -> pd.Series:
+    result = pd.Series(0, index=df.index, dtype=int)
+    df_sorted = df.sort_values([group_col, ts_col])
+    for _, grp in df_sorted.groupby(group_col):
+        ts = grp[ts_col].values.astype("int64") // 10**9
+        vals = grp[val_col].values
+        for i, idx in enumerate(grp.index):
+            t = ts[i]
+            lo = int(np.searchsorted(ts[:i], t - window_seconds, side="left"))
+            window_vals = vals[lo:i]
+            result[idx] = len(set(v for v in window_vals if v is not None and not (isinstance(v, float) and np.isnan(v))))
+    return result
+
+
 def engineer_features(df_input: pd.DataFrame) -> pd.DataFrame:
-    """
-    Engineers all features EXACTLY as they were done in the Jupyter Notebook.
-    """
     df = df_input.copy()
-    
-    # 1. IP Country
-    df['ip_country'] = df['ip_address'].apply(get_country)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.sort_values(["card_id", "timestamp"]).reset_index(drop=True)
 
-    # 2. Country Mismatches
-    df['country_mismatch'] = df['merchant_country'] != df['cardholder_country']
-    
-    def check_ip_mismatch(row):
-        if pd.isna(row['ip_country']):
-            return False
-        return row['ip_country'] != row['cardholder_country']
-    df['ip_mismatch'] = df.apply(check_ip_mismatch, axis=1)
+    # IP country
+    df["ip_country"] = df["ip_address"].apply(_get_country)
 
-    # 3. Time since last transaction
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    df = df.sort_values(['card_id', 'timestamp'])
-    df['time_since_last_transaction'] = df.groupby('card_id')['timestamp'].diff().dt.total_seconds()
-    df['is_first_transaction'] = df['time_since_last_transaction'].isna()
-    median_gap = df['time_since_last_transaction'].median()
-    df['time_since_last_transaction'] = df['time_since_last_transaction'].fillna(median_gap)
+    # Country / IP mismatches
+    df["country_mismatch"] = (df["merchant_country"] != df["cardholder_country"]).astype(int)
+    df["ip_mismatch"] = df.apply(
+        lambda r: int(r["ip_country"] is not None and r["ip_country"] != r["cardholder_country"]),
+        axis=1,
+    )
 
-    # 4. IP/Device sharing across cards
-    ip_card_counts = df.groupby('ip_address')['card_id'].nunique()
-    df['unique_cards_on_ip'] = df['ip_address'].map(ip_card_counts)
-    df['ip_shared_with_multiple_cards'] = (df['unique_cards_on_ip'] > 1) & (df['ip_address'].notna())
+    # Hour of day
+    df["hour_of_day"] = df["timestamp"].dt.hour
 
-    device_card_counts = df.groupby('device_id')['card_id'].nunique()
-    df['unique_cards_on_device'] = df['device_id'].map(device_card_counts)
-    df['device_shared_with_multiple_cards'] = (df['unique_cards_on_device'] > 1) & (df['device_id'].notna())
+    # Time since last tx per card
+    df["time_since_last_transaction"] = (
+        df.groupby("card_id")["timestamp"].diff().dt.total_seconds()
+    )
+    df["is_first_transaction"] = df["time_since_last_transaction"].isna().astype(int)
+    median_gap = df["time_since_last_transaction"].median()
+    df["time_since_last_transaction"] = df["time_since_last_transaction"].fillna(median_gap)
 
-    # 5. Rolling unique IPs per card
-    def get_rolling_unique_ips_per_card(group, window_str):
-        group = group.sort_values('timestamp')
-        results = []
-        window_td = pd.Timedelta(window_str)
-        for current_time in group['timestamp']:
-            start_time = current_time - window_td
-            mask = (group['timestamp'] > start_time) & (group['timestamp'] <= current_time)
-            unique_count = group.loc[mask, 'ip_address'].nunique()
-            results.append(unique_count)
-        return pd.Series(results, index=group.index)
+    # Impossible travel (in-person only, < 6h gap, country changed)
+    prev_country = df.groupby("card_id")["cardholder_country"].shift(1)
+    prev_channel = df.groupby("card_id")["channel"].shift(1)
+    df["is_impossible_travel"] = (
+        (df["channel"] == "in_person")
+        & (prev_channel == "in_person")
+        & (df["time_since_last_transaction"] < 6 * 3600)
+        & (df["merchant_country"] != prev_country)
+    ).astype(int)
 
-    windows = {'30min': 'card_unique_ips_30min', '60min': 'card_unique_ips_60min', '12h': 'card_unique_ips_12hr', '24h': 'card_unique_ips_1day'}
-    for window_str, col_name in windows.items():
-        df[col_name] = df.groupby('card_id', group_keys=False).apply(lambda x: get_rolling_unique_ips_per_card(x, window_str), include_groups=False)
+    # IP / device sharing across cards
+    ip_card_counts = df.groupby("ip_address")["card_id"].nunique()
+    df["unique_cards_on_ip"] = df["ip_address"].map(ip_card_counts).fillna(0).astype(int)
+    df["ip_shared_with_multiple_cards"] = (
+        (df["unique_cards_on_ip"] > 1) & df["ip_address"].notna()
+    ).astype(int)
 
-    # 6. Rolling unique IP and Merchant countries per card
-    def get_rolling_unique_values_per_card(group, column, window_str):
-        group = group.sort_values('timestamp')
-        results = []
-        window_td = pd.Timedelta(window_str)
-        for current_time in group['timestamp']:
-            start_time = current_time - window_td
-            mask = (group['timestamp'] > start_time) & (group['timestamp'] <= current_time)
-            unique_count = group.loc[mask, column].nunique()
-            results.append(unique_count)
-        return pd.Series(results, index=group.index)
+    device_card_counts = df.groupby("device_id")["card_id"].nunique()
+    df["unique_cards_on_device"] = df["device_id"].map(device_card_counts).fillna(0).astype(int)
+    df["device_shared_with_multiple_cards"] = (
+        (df["unique_cards_on_device"] > 1) & df["device_id"].notna()
+    ).astype(int)
 
-    country_windows = {'30min': '30min', '60min': '60min', '12h': '12hr', '24h': '1day'}
-    for window_str, label in country_windows.items():
-        df[f'card_unique_ip_countries_{label}'] = df.groupby('card_id', group_keys=False).apply(
-            lambda x: get_rolling_unique_values_per_card(x, 'ip_country', window_str), include_groups=False)
-        df[f'card_unique_merchant_countries_{label}'] = df.groupby('card_id', group_keys=False).apply(
-            lambda x: get_rolling_unique_values_per_card(x, 'merchant_country', window_str), include_groups=False)
+    # Per-card baselines
+    card_stats = df.groupby("card_id")["amount"].median().rename("card_avg_transaction_amount")
+    df = df.join(card_stats, on="card_id")
+    df["amount_vs_avg_ratio"] = df["amount"] / (df["card_avg_transaction_amount"] + 1e-9)
 
-    # 7. Rolling transaction velocity
-    def get_rolling_count_per_card(group, window_str):
-        group = group.sort_values('timestamp')
-        window_td = pd.Timedelta(window_str)
-        counts = []
-        for current_time in group['timestamp']:
-            start_time = current_time - window_td
-            mask = (group['timestamp'] > start_time) & (group['timestamp'] <= current_time)
-            counts.append(len(group.loc[mask]))
-        return pd.Series(counts, index=group.index)
+    card_mode_cat = df.groupby("card_id")["merchant_category"].agg(lambda x: x.mode()[0])
+    df["preferred_category"] = df["card_id"].map(card_mode_cat)
+    df["is_preferred_category"] = (df["merchant_category"] == df["preferred_category"]).astype(int)
 
-    velocity_windows = {'30min': 'tx_velocity_30min', '1h': 'tx_velocity_1hr', '24h': 'tx_velocity_1day'}
-    for window_str, col_name in velocity_windows.items():
-        df[col_name] = df.groupby('card_id', group_keys=False).apply(lambda x: get_rolling_count_per_card(x, window_str), include_groups=False)
+    card_tx_counts = df.groupby("card_id").cumcount()
+    df["total_tx_count_per_card"] = card_tx_counts + 1
+    df["unique_merchants_per_card"] = df.groupby("card_id")["merchant_name"].transform("nunique")
 
-    # 8. Spending habits & time of day
-    df['hour_of_day'] = df['timestamp'].dt.hour
-    card_avg_spend = df.groupby('card_id')['amount'].mean().rename('card_avg_transaction_amount')
-    df = df.merge(card_avg_spend, on='card_id', how='left')
-    df['amount_vs_avg_ratio'] = df['amount'] / df['card_avg_transaction_amount']
+    # Velocity windows
+    windows = {"30min": 1800, "1hr": 3600, "1day": 86400}
+    for label, secs in windows.items():
+        col = f"tx_velocity_{label}"
+        result = pd.Series(0, index=df.index, dtype=int)
+        for cid, grp in df.groupby("card_id"):
+            ts = grp["timestamp"].values.astype("int64") // 10**9
+            for i, idx in enumerate(grp.index):
+                t = ts[i]
+                lo = int(np.searchsorted(ts[:i], t - secs, side="left"))
+                result[idx] = i - lo
+        df[col] = result
 
-    fav_category = df.groupby('card_id')['merchant_category'].agg(lambda x: x.value_counts().index[0]).rename('card_preferred_category')
-    df = df.merge(fav_category, on='card_id', how='left')
-    df['is_preferred_category'] = df['merchant_category'] == df['card_preferred_category']
+    # Rolling unique IPs per card
+    for label, secs in {"30min": 1800, "60min": 3600, "12h": 43200, "24h": 86400}.items():
+        col = f"card_unique_ips_{label}"
+        result = pd.Series(0, index=df.index, dtype=int)
+        for cid, grp in df.groupby("card_id"):
+            ts = grp["timestamp"].values.astype("int64") // 10**9
+            ips = grp["ip_address"].values
+            for i, idx in enumerate(grp.index):
+                t = ts[i]
+                lo = int(np.searchsorted(ts[:i], t - secs, side="left"))
+                result[idx] = len(set(v for v in ips[lo:i] if v is not None and not (isinstance(v, float) and np.isnan(v))))
+        df[col] = result
 
-    # 9. Opposite channel counts
-    def get_opposite_channel_counts(group, window_str):
-        group = group.sort_values('timestamp')
-        window_td = pd.Timedelta(window_str)
-        results = []
-        for i, row in group.iterrows():
-            current_time = row['timestamp']
-            current_channel = row['channel']
-            opposite_channel = 'online' if current_channel == 'in_person' else 'in_person'
-            start_time = current_time - window_td
-            mask = (group['timestamp'] > start_time) & (group['timestamp'] <= current_time) & (group['channel'] == opposite_channel)
-            results.append(len(group.loc[mask]))
-        return pd.Series(results, index=group.index)
+    # Rolling unique merchant countries per card
+    for label, secs in {"30min": 1800, "60min": 3600, "12h": 43200, "24h": 86400}.items():
+        col = f"card_unique_merchant_countries_{label}"
+        result = pd.Series(0, index=df.index, dtype=int)
+        for cid, grp in df.groupby("card_id"):
+            ts = grp["timestamp"].values.astype("int64") // 10**9
+            ctrs = grp["merchant_country"].values
+            for i, idx in enumerate(grp.index):
+                t = ts[i]
+                lo = int(np.searchsorted(ts[:i], t - secs, side="left"))
+                result[idx] = len(set(ctrs[lo:i]))
+        df[col] = result
 
-    opposite_windows = {'30min': 'opposite_channel_30min', '60min': 'opposite_channel_60min', '12h': 'opposite_channel_12hr', '24h': 'opposite_channel_1day'}
-    for window_str, col_name in opposite_windows.items():
-        df[col_name] = df.groupby('card_id', group_keys=False).apply(lambda x: get_opposite_channel_counts(x, window_str), include_groups=False)
+    # Rolling unique IP countries per card
+    for label, secs in {"30min": 1800, "60min": 3600, "12h": 43200, "24h": 86400}.items():
+        col = f"card_unique_ip_countries_{label}"
+        result = pd.Series(0, index=df.index, dtype=int)
+        for cid, grp in df.groupby("card_id"):
+            ts = grp["timestamp"].values.astype("int64") // 10**9
+            ipc = grp["ip_country"].values
+            for i, idx in enumerate(grp.index):
+                t = ts[i]
+                lo = int(np.searchsorted(ts[:i], t - secs, side="left"))
+                result[idx] = len(set(v for v in ipc[lo:i] if v is not None and not (isinstance(v, float) and np.isnan(v))))
+        df[col] = result
 
-    # 10. Impossible Travel
-    def calculate_travel_metrics(group):
-        group = group.sort_values('timestamp')
-        group['is_impossible_travel'] = False
-        group['hour_gap'] = np.nan
-        group['prev_merchant_country'] = None
-        in_person = group[group['channel'] == 'in_person'].copy()
-        if len(in_person) > 1:
-            in_person['prev_merchant_country_val'] = in_person['merchant_country'].shift(1)
-            in_person['prev_timestamp'] = in_person['timestamp'].shift(1)
-            in_person['hour_gap_val'] = (in_person['timestamp'] - in_person['prev_timestamp']).dt.total_seconds() / 3600
-            in_person['is_impossible_travel_val'] = (in_person['merchant_country'] != in_person['prev_merchant_country_val']) & \
-                                                   (in_person['prev_merchant_country_val'].notna()) & \
-                                                   (in_person['hour_gap_val'] < 6)
-            group.loc[in_person.index, 'is_impossible_travel'] = in_person['is_impossible_travel_val']
-            group.loc[in_person.index, 'hour_gap'] = in_person['hour_gap_val']
-            group.loc[in_person.index, 'prev_merchant_country'] = in_person['prev_merchant_country_val']
-        return group
+    # Opposite channel switches per card
+    for label, secs in {"30min": 1800, "60min": 3600, "12h": 43200, "24h": 86400}.items():
+        col = f"opposite_channel_{label}"
+        result = pd.Series(0, index=df.index, dtype=int)
+        for cid, grp in df.groupby("card_id"):
+            ts = grp["timestamp"].values.astype("int64") // 10**9
+            chans = grp["channel"].values
+            for i, idx in enumerate(grp.index):
+                t = ts[i]
+                lo = int(np.searchsorted(ts[:i], t - secs, side="left"))
+                cur = chans[i]
+                if cur == "online":
+                    opp = "in_person"
+                elif cur == "in_person":
+                    opp = "online"
+                else:
+                    opp = None
+                if opp:
+                    result[idx] = int(np.sum(chans[lo:i] == opp))
+        df[col] = result
 
-    df['card_id_copy'] = df['card_id']
-    df = df.groupby('card_id_copy', group_keys=False).apply(calculate_travel_metrics, include_groups=False)
-
-    # 11. Merchant-Card Density
-    def get_merchant_card_density(group):
-        group = group.sort_values('timestamp')
-        window_td = pd.Timedelta('1h')
-        results = []
-        for current_time in group['timestamp']:
-            mask = (group['timestamp'] > (current_time - window_td)) & (group['timestamp'] <= current_time)
-            results.append(group.loc[mask, 'card_id'].nunique())
-        return pd.Series(results, index=group.index)
-
-    df['merchant_unique_cards_1hr'] = df.groupby('merchant_name', group_keys=False).apply(get_merchant_card_density, include_groups=False)
-
-    # 12. Transaction count / unique merchants
-    df['total_tx_count_per_card'] = df.groupby('card_id')['transaction_id'].transform('count')
-    df['unique_merchants_per_card'] = df.groupby('card_id')['merchant_name'].transform('nunique')
+    # Merchant burst: unique cards per merchant in last 1hr
+    result = pd.Series(0, index=df.index, dtype=int)
+    for mname, grp in df.groupby("merchant_name"):
+        ts = grp["timestamp"].values.astype("int64") // 10**9
+        cards = grp["card_id"].values
+        for i, idx in enumerate(grp.index):
+            t = ts[i]
+            lo = int(np.searchsorted(ts[:i], t - 3600, side="left"))
+            result[idx] = len(set(cards[lo:i]))
+    df["merchant_unique_cards_1hr"] = result
 
     return df
 
-def run_anomaly_detection(df: pd.DataFrame) -> pd.DataFrame:
-    global MODELS, SCALER, EXPLAINER, BASELINE_EXPECTED_VALUE, FEATURES_USED, SHAP_VALUES_CACHE, X_SCALED_DF_CACHE
-    
-    model_features = [
-        'amount', 'time_since_last_transaction', 'amount_vs_avg_ratio', 'card_avg_transaction_amount',
-        'tx_velocity_30min', 'tx_velocity_1hr', 'tx_velocity_1day',
-        'card_unique_ips_30min', 'card_unique_ips_60min', 'card_unique_ips_12hr', 'card_unique_ips_1day',
-        'card_unique_ip_countries_30min', 'card_unique_ip_countries_60min', 'card_unique_ip_countries_12hr', 'card_unique_ip_countries_1day',
-        'card_unique_merchant_countries_30min', 'card_unique_merchant_countries_60min', 'card_unique_merchant_countries_12hr', 'card_unique_merchant_countries_1day',
-        'opposite_channel_30min', 'opposite_channel_60min', 'opposite_channel_12hr', 'opposite_channel_1day',
-        'merchant_unique_cards_1hr', 'total_tx_count_per_card', 'unique_merchants_per_card',
-        'hour_of_day', 'country_mismatch', 'ip_mismatch', 'is_impossible_travel',
-        'is_preferred_category', 'ip_shared_with_multiple_cards', 'is_first_transaction'
-    ]
-    FEATURES_USED = model_features
 
-    X = df[model_features].copy()
-    
-    for col in X.select_dtypes(include=['bool']).columns:
-        X[col] = X[col].astype(int)
-        
-    X = X.fillna(X.median())
-    
-    SCALER = RobustScaler()
-    X_scaled = SCALER.fit_transform(X)
-    X_scaled_df = pd.DataFrame(X_scaled, columns=model_features, index=df.index)
-    
-    MODELS = {
-        'iforest': IForest(contamination=0.07, n_estimators=200, random_state=42),
-        'ecod': ECOD(contamination=0.07),
-        'copod': COPOD(contamination=0.07),
-        'hbos': HBOS(contamination=0.07, n_bins='auto')
+# ── Model training & scoring ───────────────────────────────────────────────────
+
+MODEL_FEATURES = [
+    "tx_velocity_30min", "tx_velocity_1hr", "tx_velocity_1day",
+    "country_mismatch", "ip_mismatch", "is_impossible_travel",
+    "card_unique_ips_30min", "card_unique_ips_60min", "card_unique_ips_12h", "card_unique_ips_24h",
+    "card_unique_merchant_countries_30min", "card_unique_merchant_countries_60min",
+    "card_unique_merchant_countries_12h", "card_unique_merchant_countries_24h",
+    "card_unique_ip_countries_30min", "card_unique_ip_countries_60min",
+    "card_unique_ip_countries_12h", "card_unique_ip_countries_24h",
+    "opposite_channel_30min", "opposite_channel_60min", "opposite_channel_12h", "opposite_channel_24h",
+    "ip_shared_with_multiple_cards", "device_shared_with_multiple_cards",
+    "merchant_unique_cards_1hr",
+    "amount_vs_avg_ratio", "is_preferred_category",
+    "time_since_last_transaction", "is_first_transaction",
+    "total_tx_count_per_card", "unique_merchants_per_card",
+    "hour_of_day",
+]
+
+DETECTORS = {
+    "iforest": IForest(n_estimators=200, contamination=0.07, random_state=42),
+    "ecod":    ECOD(contamination=0.07),
+    "copod":   COPOD(contamination=0.07),
+    "hbos":    HBOS(contamination=0.07),
+}
+
+CONFIDENCE_MAP = {0: "normal", 1: "ignore", 2: "low", 3: "medium", 4: "high"}
+
+
+def _rank_normalize(scores: np.ndarray) -> np.ndarray:
+    return (rankdata(scores) - 1) / (len(scores) - 1) * 1000
+
+
+def _get_top_shap_features(shap_row, feature_names, feature_values, n: int = 5):
+    indexed = sorted(enumerate(shap_row), key=lambda x: abs(x[1]), reverse=True)[:n]
+    return [
+        {
+            "feature": feature_names[i],
+            "value": float(feature_values[i]),
+            "impact": float(v),
+            "direction": "fraud" if v > 0 else "normal",
+        }
+        for i, v in indexed
+    ]
+
+
+def _build_evidence_snapshot(row) -> dict:
+    def _int(val, default=0):
+        try:
+            v = val
+            if isinstance(v, float) and np.isnan(v):
+                return default
+            return int(v)
+        except Exception:
+            return default
+
+    def _bool(val):
+        try:
+            if isinstance(val, float) and np.isnan(val):
+                return False
+            return bool(val)
+        except Exception:
+            return False
+
+    return {
+        "velocity": {
+            "last_30min": _int(row.get("tx_velocity_30min")),
+            "last_1hr":   _int(row.get("tx_velocity_1hr")),
+            "last_day":   _int(row.get("tx_velocity_1day")),
+        },
+        "geo": {
+            "cardholder_country":  str(row.get("cardholder_country", "")),
+            "merchant_country":    str(row.get("merchant_country", "")),
+            "ip_country":          str(row.get("ip_country", "")) if row.get("ip_country") else None,
+            "country_mismatch":    _bool(row.get("country_mismatch")),
+            "ip_mismatch":         _bool(row.get("ip_mismatch")),
+            "impossible_travel":   _bool(row.get("is_impossible_travel")),
+        },
+        "spending": {
+            "amount":    float(row.get("amount", 0)),
+            "card_avg":  float(row.get("card_avg_transaction_amount", 0)),
+            "ratio":     float(row.get("amount_vs_avg_ratio", 1)),
+        },
+        "device_ip": {
+            "device_shared":           _bool(row.get("device_shared_with_multiple_cards")),
+            "ip_shared":               _bool(row.get("ip_shared_with_multiple_cards")),
+            "unique_cards_on_device":  _int(row.get("unique_cards_on_device")),
+            "unique_cards_on_ip":      _int(row.get("unique_cards_on_ip")),
+        },
+        "channel": {
+            "channel":                row.get("channel", ""),
+            "opposite_count_30min":   _int(row.get("opposite_channel_30min")),
+        },
+        "merchant": {
+            "unique_cards_1hr": _int(row.get("merchant_unique_cards_1hr")),
+        },
     }
-    
-    raw_scores = {}
-    binary_labels = {}
-    
-    for name, det in MODELS.items():
+
+
+def _build_signals(row, shap_features: list) -> list:
+    signals = []
+    ev = _build_evidence_snapshot(row)
+
+    if ev["geo"]["country_mismatch"]:
+        signals.append(f"Merchant country ({ev['geo']['merchant_country']}) differs from cardholder country ({ev['geo']['cardholder_country']})")
+    if ev["geo"]["ip_mismatch"] and ev["geo"]["ip_country"]:
+        signals.append(f"IP resolved to {ev['geo']['ip_country']}, card is {ev['geo']['cardholder_country']}")
+    if ev["geo"]["impossible_travel"]:
+        signals.append("Impossible travel: in-person transaction in different country within 6 hours")
+    if ev["spending"]["ratio"] > 5:
+        signals.append(f"Amount {ev['spending']['ratio']:.1f}× this card's median spend")
+    if ev["velocity"]["last_30min"] >= 3:
+        signals.append(f"{ev['velocity']['last_30min']} transactions from this card in the last 30 minutes")
+    if ev["device_ip"]["device_shared"]:
+        signals.append(f"Device shared across {ev['device_ip']['unique_cards_on_device']} cards")
+    if ev["device_ip"]["ip_shared"]:
+        signals.append(f"IP address shared across {ev['device_ip']['unique_cards_on_ip']} cards")
+    if ev["merchant"]["unique_cards_1hr"] >= 5:
+        signals.append(f"{ev['merchant']['unique_cards_1hr']} different cards used at this merchant in the last hour")
+    if ev["channel"]["opposite_count_30min"] > 0:
+        signals.append("Unusual channel switch detected in the last 30 minutes")
+
+    if not signals and shap_features:
+        top = shap_features[0]
+        signals.append(f"Top anomaly signal: {top['feature'].replace('_', ' ')}")
+
+    return signals[:4]
+
+
+def run_full_pipeline(df_raw: pd.DataFrame) -> pd.DataFrame:
+    global SCORED_DF_CACHE, SHAP_VALUES_CACHE, X_SCALED_DF_CACHE, FEATURES_USED
+
+    df = engineer_features(df_raw)
+    FEATURES_USED = MODEL_FEATURES
+
+    X = df[MODEL_FEATURES].fillna(0).values
+    scaler = RobustScaler()
+    X_scaled = scaler.fit_transform(X)
+    X_scaled_df = pd.DataFrame(X_scaled, columns=MODEL_FEATURES, index=df.index)
+
+    # Fit all 4 models
+    raw_scores, labels = {}, {}
+    for name, det in DETECTORS.items():
         det.fit(X_scaled)
         raw_scores[name] = det.decision_scores_
-        binary_labels[name] = det.labels_
-        
-    labels_df = pd.DataFrame(binary_labels)
-    labels_df['votes'] = labels_df.sum(axis=1)
-    
-    ranked_scores = np.column_stack([
-        rankdata(raw_scores[name]) for name in MODELS.keys()
-    ])
-    ensemble_score = ranked_scores.mean(axis=1)
-    
-    df['anomaly_score'] = ensemble_score
-    df['votes'] = labels_df['votes'].values
-    
-    confidence_mapping = {
-        0: 'normal',
-        1: 'ignore',
-        2: 'low confidence',
-        3: 'medium confidence',
-        4: 'high confidence'
-    }
-    df['fraud_confidence'] = df['votes'].map(confidence_mapping)
-    df['is_fraud'] = (df['votes'] >= 3).astype(int)
+        labels[name]     = det.labels_
 
-    # Calculate SHAP values on IForest for explainability
-    EXPLAINER = shap.TreeExplainer(MODELS['iforest'].detector_)
-    shap_values = EXPLAINER.shap_values(X_scaled)
-    if isinstance(shap_values, list):
-        shap_values = shap_values[1]
-        
-    BASELINE_EXPECTED_VALUE = EXPLAINER.expected_value
-    
-    SHAP_VALUES_CACHE = shap_values
+    # Rank-normalize each model's scores to 0–1000
+    norm_scores = {name: _rank_normalize(s) for name, s in raw_scores.items()}
+
+    # Ensemble: average of rank-normalized scores
+    ensemble = np.mean(np.stack(list(norm_scores.values())), axis=0)
+
+    # Majority vote: 3 of 4 models required
+    votes = np.sum(np.stack(list(labels.values())), axis=0)
+    is_fraud = (votes >= 3).astype(int)
+
+    df["anomaly_score"]    = ensemble
+    df["votes"]            = votes
+    df["is_fraud"]         = is_fraud
+    df["fraud_confidence"] = [CONFIDENCE_MAP.get(int(v), "normal") for v in votes]
+
+    # Per-model scores and votes stored per row
+    df["model_scores"] = [
+        {
+            "iforest": float(norm_scores["iforest"][i]),
+            "ecod":    float(norm_scores["ecod"][i]),
+            "copod":   float(norm_scores["copod"][i]),
+            "hbos":    float(norm_scores["hbos"][i]),
+        }
+        for i in range(len(df))
+    ]
+    df["model_votes"] = [
+        {
+            "iforest": int(labels["iforest"][i]),
+            "ecod":    int(labels["ecod"][i]),
+            "copod":   int(labels["copod"][i]),
+            "hbos":    int(labels["hbos"][i]),
+        }
+        for i in range(len(df))
+    ]
+
+    # SHAP on Isolation Forest
+    explainer = shap.TreeExplainer(DETECTORS["iforest"].detector_)
+    shap_vals = explainer.shap_values(X_scaled_df)
+
+    df["shap_top_features"] = [
+        _get_top_shap_features(shap_vals[i], MODEL_FEATURES, X_scaled_df.iloc[i].values)
+        for i in range(len(df))
+    ]
+
+    df["evidence_snapshot"] = [
+        _build_evidence_snapshot(df.iloc[i])
+        for i in range(len(df))
+    ]
+
+    df["signals"] = [
+        _build_signals(df.iloc[i], df.iloc[i]["shap_top_features"])
+        for i in range(len(df))
+    ]
+
+    # Cache
+    SCORED_DF_CACHE   = df.copy()
+    SHAP_VALUES_CACHE = shap_vals
     X_SCALED_DF_CACHE = X_scaled_df
-    
-    # Store top SHAP reasons for each row directly in the dataframe
-    top_reasons_list = []
-    for idx in range(len(X_scaled_df)):
-        feat_importance = sorted(
-            zip(model_features, shap_values[idx]),
-            key=lambda x: abs(x[1]),
-            reverse=True
-        )[:3]  # top 3 reasons
-        
-        reasons = []
-        for feat, contrib in feat_importance:
-            if abs(contrib) > 0.05: # Only include if it has a meaningful impact
-                direction = "increases" if contrib > 0 else "decreases"
-                val = X_scaled_df.iloc[idx][feat]
-                if feat == "is_impossible_travel" and val > 0:
-                    reasons.append("Impossible travel detected (country changed within 6h)")
-                elif feat == "country_mismatch" and val > 0:
-                    reasons.append("Merchant and Cardholder country mismatch")
-                elif feat == "ip_mismatch" and val > 0:
-                    reasons.append("IP country and Cardholder country mismatch")
-                elif feat == "amount_vs_avg_ratio" and contrib > 0:
-                    reasons.append(f"Amount is unusually high for this card")
-                elif "tx_velocity" in feat and contrib > 0:
-                    reasons.append(f"High transaction velocity detected")
-                elif "opposite_channel" in feat and contrib > 0:
-                    reasons.append(f"Mixed in-person/online channel activity")
-                elif feat == "ip_shared_with_multiple_cards" and val > 0:
-                    reasons.append(f"IP address shared across multiple cards")
-                else:
-                    # Generic fallback
-                    if contrib > 0:
-                        reasons.append(f"Anomalous {feat}")
-        
-        # Ensure there's at least one reason if it's flagged as fraud
-        if df.iloc[idx]['is_fraud'] == 1 and not reasons:
-            reasons.append("Multiple anomalous behavior patterns detected")
-            
-        top_reasons_list.append(reasons)
-        
-    df['signals'] = top_reasons_list
 
     return df
 
-def run_full_pipeline(df: pd.DataFrame) -> pd.DataFrame:
+
+# ── Claude explanation ─────────────────────────────────────────────────────────
+
+_FEATURE_LABELS = {
+    "tx_velocity_30min":                    "Transaction velocity (30 min)",
+    "tx_velocity_1hr":                      "Transaction velocity (1 hr)",
+    "tx_velocity_1day":                     "Transaction velocity (1 day)",
+    "country_mismatch":                     "Country mismatch",
+    "ip_mismatch":                          "IP country mismatch",
+    "is_impossible_travel":                 "Impossible travel",
+    "card_unique_ips_30min":                "Unique IPs (30 min)",
+    "card_unique_ips_60min":                "Unique IPs (1 hr)",
+    "card_unique_ips_12h":                  "Unique IPs (12 hr)",
+    "card_unique_ips_24h":                  "Unique IPs (24 hr)",
+    "card_unique_merchant_countries_30min": "Unique merchant countries (30 min)",
+    "card_unique_merchant_countries_60min": "Unique merchant countries (1 hr)",
+    "card_unique_merchant_countries_12h":   "Unique merchant countries (12 hr)",
+    "card_unique_merchant_countries_24h":   "Unique merchant countries (24 hr)",
+    "card_unique_ip_countries_30min":       "Unique IP countries (30 min)",
+    "card_unique_ip_countries_60min":       "Unique IP countries (1 hr)",
+    "card_unique_ip_countries_12h":         "Unique IP countries (12 hr)",
+    "card_unique_ip_countries_24h":         "Unique IP countries (24 hr)",
+    "opposite_channel_30min":               "Channel switches (30 min)",
+    "opposite_channel_60min":               "Channel switches (1 hr)",
+    "opposite_channel_12h":                 "Channel switches (12 hr)",
+    "opposite_channel_24h":                 "Channel switches (24 hr)",
+    "ip_shared_with_multiple_cards":        "IP shared across cards",
+    "device_shared_with_multiple_cards":    "Device shared across cards",
+    "merchant_unique_cards_1hr":            "Merchant card burst (1 hr)",
+    "amount_vs_avg_ratio":                  "Unusual spend amount",
+    "is_preferred_category":                "Preferred category",
+    "time_since_last_transaction":          "Time since last transaction",
+    "is_first_transaction":                 "First transaction for card",
+    "total_tx_count_per_card":              "Total transactions per card",
+    "unique_merchants_per_card":            "Unique merchants per card",
+    "hour_of_day":                          "Hour of day",
+}
+
+
+def explain_transaction_with_claude(transaction_id: str) -> dict:
     global SCORED_DF_CACHE
-    df_engineered = engineer_features(df)
-    df_scored = run_anomaly_detection(df_engineered)
-    SCORED_DF_CACHE = df_scored
-    return df_scored
 
-def explain_transaction_with_gemini(transaction_id: str) -> str:
-    """
-    Dynamically loads the database, calculates SHAP feature importance for the given transaction_id,
-    and calls the Gemini-2.5-Flash model to generate a professional natural language explanation.
-    Falls back to a high-fidelity local SHAP-based explanation if the API key is not configured.
-    """
-    global SCORED_DF_CACHE, SHAP_VALUES_CACHE, X_SCALED_DF_CACHE
+    if SCORED_DF_CACHE is None:
+        return _fallback_explanation("No data loaded. Please ingest transactions first.")
 
-    # Configure Gemini API or flag local fallback
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    use_local_fallback = False
-    if api_key:
-        genai.configure(api_key=api_key)
-    else:
-        use_local_fallback = True
+    matches = SCORED_DF_CACHE[SCORED_DF_CACHE["transaction_id"] == transaction_id]
+    if matches.empty:
+        return _fallback_explanation(f"Transaction {transaction_id} not found in cache.")
+
+    row = matches.iloc[0]
+    ev = row.get("evidence_snapshot", {})
+    shap_top = row.get("shap_top_features", [])
+    model_votes = row.get("model_votes", {})
+    model_scores = row.get("model_scores", {})
+
+    signals_text = "\n".join(
+        f"  - {_FEATURE_LABELS.get(f['feature'], f['feature'])}: "
+        f"impact={f['impact']:+.3f} ({'fraud' if f['direction']=='fraud' else 'normal'})"
+        for f in shap_top[:5]
+    )
+
+    model_text = "\n".join(
+        f"  - {name.upper()}: score={model_scores.get(name, 0):.0f}/1000, vote={'FRAUD' if model_votes.get(name) else 'NORMAL'}"
+        for name in ["iforest", "ecod", "copod", "hbos"]
+    )
+
+    prompt = f"""You are a senior fraud analyst AI. Analyze this suspicious credit card transaction and provide a structured JSON assessment.
+
+Transaction ID: {transaction_id}
+Amount: ${row['amount']:.2f} CAD
+Merchant: {row['merchant_name']} ({row['merchant_category']})
+Channel: {row['channel']}
+Cardholder country: {ev.get('geo', {}).get('cardholder_country', 'N/A')}
+Merchant country: {ev.get('geo', {}).get('merchant_country', 'N/A')}
+IP country: {ev.get('geo', {}).get('ip_country', 'N/A')}
+Ensemble anomaly score: {row['anomaly_score']:.0f}/1000
+Models flagging fraud: {row['votes']}/4 ({row['fraud_confidence']} confidence)
+
+Model verdicts:
+{model_text}
+
+Top SHAP signals driving the anomaly score:
+{signals_text}
+
+Velocity: {ev.get('velocity', {}).get('last_30min', 0)} txns/30min, {ev.get('velocity', {}).get('last_1hr', 0)} txns/1hr
+Spending: ${row['amount']:.2f} vs card avg ${ev.get('spending', {}).get('card_avg', 0):.2f} ({ev.get('spending', {}).get('ratio', 1):.1f}× baseline)
+Device shared: {ev.get('device_ip', {}).get('device_shared', False)}, IP shared: {ev.get('device_ip', {}).get('ip_shared', False)}
+
+Respond ONLY with valid JSON in this exact format (no markdown, no extra text):
+{{
+  "summary": "<one concise sentence executive summary>",
+  "why_suspicious": ["<reason 1>", "<reason 2>", "<reason 3>"],
+  "key_signals": ["<signal name 1>", "<signal name 2>", "<signal name 3>"],
+  "recommended_action": "BLOCK",
+  "reason": "<one sentence justification for the recommended action>"
+}}
+
+recommended_action must be exactly one of: APPROVE, BLOCK, ESCALATE"""
 
     try:
-        # If cache contains the transaction_id, fetch from cache instantly! (0ms latency)
-        if SCORED_DF_CACHE is not None and transaction_id in SCORED_DF_CACHE['transaction_id'].values:
-            df_scored = SCORED_DF_CACHE
-            shap_values = SHAP_VALUES_CACHE
-            X_scaled_df = X_SCALED_DF_CACHE
-        else:
-            # Load the base file
-            db_path = 'transactions.csv'
-            if not os.path.exists(db_path):
-                db_path = os.path.join('backend', 'transactions.csv')
-                
-            if not os.path.exists(db_path):
-                return "Transaction database csv file not found."
-    
-            df_orig = pd.read_csv(db_path)
-            
-            # Verify transaction exists
-            if transaction_id not in df_orig['transaction_id'].values:
-                return f"Transaction {transaction_id} not found in database."
-                
-            # Run full pipeline to calculate features, scaler and SHAP values
-            df_scored = run_full_pipeline(df_orig)
-            shap_values = SHAP_VALUES_CACHE
-            X_scaled_df = X_SCALED_DF_CACHE
-        
-        # Locate the specific transaction row index
-        row_idx = df_scored[df_scored['transaction_id'] == transaction_id].index[0]
-        
-        # We need the feature matrix X scaled
-        X = df_scored[FEATURES_USED].copy()
-        for col in X.select_dtypes(include=['bool']).columns:
-            X[col] = X[col].astype(int)
-        X = X.fillna(X.median())
-        
-        X_scaled = SCALER.transform(X)
-        X_scaled_df = pd.DataFrame(X_scaled, columns=FEATURES_USED, index=df_scored.index)
-        
-        # Calculate SHAP values for this index
-        shap_values = EXPLAINER.shap_values(X_scaled)
-        if isinstance(shap_values, list):
-            shap_values = shap_values[1]
-            
-        # Get top N features driving this prediction
-        top_n = 5
-        feat_importance = sorted(
-            zip(FEATURES_USED, shap_values[row_idx]),
-            key=lambda x: abs(x[1]),
-            reverse=True
-        )[:top_n]
-        
-        row_data = df_scored.iloc[row_idx]
-        
-        # If no API key, build a premium, highly detailed local mathematical explanation based on exact SHAP values
-        if use_local_fallback:
-            reasons = row_data.get('signals', [])
-            if not reasons:
-                reasons = [f"Anomalous {feat.replace('_', ' ')}" for feat, contrib in feat_importance if contrib > 0.05]
-            if not reasons:
-                reasons = ["Multiple anomalous behavior patterns detected"]
-            
-            reasons_bullets = "\n".join([f"• {reason}" for reason in reasons])
-            
-            return (
-                f"🚨 [LOCAL SHAP ANALYSIS] This transaction has been flagged as suspicious based on {len(reasons)} primary risk factors:\n"
-                f"{reasons_bullets}\n\n"
-                f"Detail Summary:\n"
-                f"- Transaction amount: {row_data.get('amount', 'N/A')}$ vs average spend.\n"
-                f"- Time of day: {row_data.get('hour_of_day', 'N/A')}:00\n"
-                f"- Anomaly detection score: {row_data.get('anomaly_score', 'N/A'):.1f}/1000 (consensus across 4 independent anomaly models)."
-            )
-
-        feature_context = "\n".join([
-            f"- {feat}: value={X_scaled_df.iloc[row_idx][feat]:.2f}, "
-            f"SHAP contribution={contrib:+.4f} ({'increases' if contrib > 0 else 'decreases'} fraud score)"
-            for feat, contrib in feat_importance
-        ])
-        
-        prompt = f"""
-A transaction has been flagged as high-confidence fraud by 4 independent
-anomaly detection models. Here are the top features driving this decision:
-
-{feature_context}
-
-Transaction details:
-- Amount: {row_data.get('amount', 'N/A')}
-- Hour of day: {row_data.get('hour_of_day', 'N/A')}
-- Confidence level: {row_data.get('fraud_confidence', 'N/A')}
-- Anomaly score: {row_data.get('anomaly_score', 'N/A'):.1f}/1000
-
-In 2-3 sentences, explain why this transaction is suspicious in plain English
-for a fraud analyst. Be specific about which signals are most concerning.
-"""
-        
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        response = model.generate_content(prompt)
-        return response.text.strip()
-        
+        client = anthropic.Anthropic()
+        message = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = message.content[0].text.strip()
+        # Strip markdown fences if present
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        data = json.loads(raw)
+        return {
+            "summary":            data.get("summary", ""),
+            "why_suspicious":     data.get("why_suspicious", []),
+            "key_signals":        data.get("key_signals", []),
+            "recommended_action": data.get("recommended_action", "ESCALATE"),
+            "reason":             data.get("reason", ""),
+        }
     except Exception as e:
-        return f"Error generating explanation: {str(e)}"
+        signals = row.get("signals", [])
+        return {
+            "summary":            f"Anomaly score {row['anomaly_score']:.0f}/1000 — {row['votes']}/4 models flagged fraud.",
+            "why_suspicious":     signals[:3] if signals else ["Multiple fraud signals detected"],
+            "key_signals":        [f["feature"] for f in shap_top[:3]],
+            "recommended_action": "ESCALATE",
+            "reason":             f"Claude API unavailable ({e}); manual review required.",
+        }
+
+
+def _fallback_explanation(msg: str) -> dict:
+    return {
+        "summary":            msg,
+        "why_suspicious":     [],
+        "key_signals":        [],
+        "recommended_action": "ESCALATE",
+        "reason":             "Unable to generate explanation.",
+    }

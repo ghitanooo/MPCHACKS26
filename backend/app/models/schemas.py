@@ -1,8 +1,10 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Any
 from datetime import datetime
 
-class TransactionBase(BaseModel):
+
+class TransactionOut(BaseModel):
+    id: str = Field(alias="_id")
     transaction_id: str
     timestamp: str
     card_id: str
@@ -14,21 +16,25 @@ class TransactionBase(BaseModel):
     merchant_country: str
     device_id: Optional[str] = None
     ip_address: Optional[str] = None
-
-class TransactionOut(TransactionBase):
-    id: str = Field(alias="_id")
-    anomaly_score: float
-    is_fraud: int
-    fraud_confidence: str
-    votes: int
+    anomaly_score: float = 0
+    is_fraud: int = 0
+    fraud_confidence: str = "normal"
+    votes: int = 0
     signals: List[str] = []
-    status: str = "Review" # 'Review', 'Approved', 'Blocked', 'Escalated'
-    
+    status: str = "Review"
+    model_scores: Optional[dict] = {}
+    model_votes: Optional[dict] = {}
+    shap_top_features: Optional[list] = []
+    evidence_snapshot: Optional[dict] = {}
+    decision_at: Optional[str] = None
+
     class Config:
         populate_by_name = True
 
+
 class TriageAction(BaseModel):
-    decision: str # "APPROVE", "BLOCK", "ESCALATE"
+    decision: str  # "APPROVE", "BLOCK", "ESCALATE"
+
 
 class AuditLog(BaseModel):
     transaction_id: str
@@ -36,3 +42,11 @@ class AuditLog(BaseModel):
     timestamp: datetime
     risk_score: float
     amount: float
+
+
+class ExplanationOut(BaseModel):
+    summary: str
+    why_suspicious: List[str]
+    key_signals: List[str]
+    recommended_action: str
+    reason: str
