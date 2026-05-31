@@ -239,8 +239,8 @@ export default function CaseView() {
                   transition={{ delay: 0.2 }}
                   className="space-y-4"
                 >
-                  <EvidenceSection tx={activeCase} />
                   <ClaudeExplanation explanation={explanation} loading={loadingExpl} />
+                  <EvidenceSection tx={activeCase} />
                 </motion.div>
               )}
             </AnimatePresence>
