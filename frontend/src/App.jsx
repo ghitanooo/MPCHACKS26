@@ -18,6 +18,39 @@ function App() {
   const [explanation, setExplanation] = useState(null);
   const [loadingExplanation, setLoadingExplanation] = useState(false);
 
+  // Bottom panel (drawer) resizable height states
+  const [footerHeight, setFooterHeight] = useState(240); // 240px default
+  const [isResizing, setIsResizing] = useState(false);
+
+  const startResizing = useCallback((e) => {
+    e.preventDefault();
+    setIsResizing(true);
+  }, []);
+
+  const stopResizing = useCallback(() => {
+    setIsResizing(false);
+  }, []);
+
+  const resize = useCallback((e) => {
+    if (isResizing) {
+      const newHeight = window.innerHeight - e.clientY;
+      if (newHeight > 48 && newHeight < window.innerHeight * 0.8) {
+        setFooterHeight(newHeight);
+      }
+    }
+  }, [isResizing]);
+
+  useEffect(() => {
+    if (isResizing) {
+      window.addEventListener('mousemove', resize);
+      window.addEventListener('mouseup', stopResizing);
+    }
+    return () => {
+      window.removeEventListener('mousemove', resize);
+      window.removeEventListener('mouseup', stopResizing);
+    };
+  }, [isResizing, resize, stopResizing]);
+
   const fetchExplanation = async (id) => {
     if (!id) return;
     setLoadingExplanation(true);
@@ -390,13 +423,32 @@ function App() {
       </div>
 
       {/* Bottom: Audit Ledger of Frauds & Actions */}
-      <footer className="h-60 border-t border-outline-variant bg-surface-container-lowest flex flex-col shrink-0 overflow-hidden">
-        <div className="px-container-padding h-12 border-b border-outline-variant bg-surface-container-low flex items-center justify-between">
+      <footer style={{ height: `${footerHeight}px` }} className="border-t border-outline-variant bg-surface-container-lowest flex flex-col shrink-0 overflow-hidden relative select-none">
+        {/* Drag Resize Handle */}
+        <div 
+          onMouseDown={startResizing} 
+          className="h-1.5 w-full cursor-ns-resize bg-outline-variant/30 hover:bg-primary/50 transition-colors shrink-0 z-50 relative group flex items-center justify-center"
+        >
+          <div className="w-16 h-1 bg-outline rounded group-hover:bg-primary transition-colors absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2"></div>
+        </div>
+
+        <div className="px-container-padding h-12 border-b border-outline-variant bg-surface-container-low flex items-center justify-between shrink-0">
           <div className="flex items-center gap-4">
             <span className="text-label-caps text-on-surface-variant font-bold flex items-center gap-2">
               <span className="w-2.5 h-2.5 rounded-full bg-error animate-pulse"></span>
               Audit History Log
             </span>
+            
+            {/* Collapse/Expand toggle button */}
+            <button 
+              onClick={() => setFooterHeight(prev => prev > 48 ? 48 : 320)}
+              className="flex items-center justify-center p-1 hover:bg-surface-container-high rounded text-on-surface-variant hover:text-primary transition-colors"
+              title={footerHeight > 48 ? "Collapse Drawer" : "Expand Drawer"}
+            >
+              <span className="material-symbols-outlined text-[18px]">
+                {footerHeight > 48 ? "keyboard_arrow_down" : "keyboard_arrow_up"}
+              </span>
+            </button>
             
             {/* Filter Buttons */}
             <div className="flex bg-surface-container-high border border-outline-variant rounded p-0.5 ml-2">
